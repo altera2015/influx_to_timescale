@@ -31,11 +31,14 @@ except ImportError as e:
 
 class InfluxToTimescaleMigrator:
     def __init__(self, influx_config: Dict[str, str], timescale_config: Dict[str, str],
-                 chunk_days: int = 1, state_file: str = "migration_state.json"):
+                 chunk_days: int = 1, state_file: str = "migration_state.json",
+                 tag_columns: Optional[List[str]] = None, suppress_tags_column: bool = False):
         self.influx_config = influx_config
         self.timescale_config = timescale_config
         self.chunk_days = chunk_days
         self.state_file = state_file
+        self.tag_columns = tag_columns or []
+        self.suppress_tags_column = suppress_tags_column
         self.logger = self._setup_logger()
 
         # Initialize connections
@@ -247,8 +250,15 @@ class InfluxToTimescaleMigrator:
                 pg_type = self._map_influx_type_to_postgres(field_type)
                 columns.append(f"{field_name} {pg_type}")
 
-            # Add tags as text columns (assuming all tags are strings)
-            columns.append("tags JSONB")
+            # Add extracted tag columns as TEXT
+            for tag_col in self.tag_columns:
+                # Sanitize column name
+                safe_tag_col = tag_col.replace('-', '_').replace(' ', '_')
+                columns.append(f"{safe_tag_col} TEXT")
+
+            # Add remaining tags as JSONB column (unless suppressed)
+            if not self.suppress_tags_column:
+                columns.append("tags JSONB")
 
             create_table_sql = f'''
             CREATE TABLE IF NOT EXISTS {table_name} (
@@ -508,20 +518,43 @@ class InfluxToTimescaleMigrator:
                         value = None
                     field_values.append(value)
 
-                # Extract tags as JSON
-                tags = {}
+                # Extract specific tag columns and remaining tags
+                tag_column_values = []
+                remaining_tags = {}
+                
                 for col in df.columns:
                     if col not in ['_time', '_measurement'] + list(fields.keys()):
                         if not col.startswith('_'):  # Exclude InfluxDB system columns
-                            tags[col] = row[col]
+                            if col in self.tag_columns:
+                                # This tag should be extracted to its own column
+                                tag_column_values.append(row.get(col))
+                            elif not self.suppress_tags_column:
+                                # This tag goes into the remaining tags JSON (only if tags column is not suppressed)
+                                remaining_tags[col] = row[col]
 
-                # Convert tags dict to JSON string for JSONB column
-                tags_json = json.dumps(tags) if tags else '{}'
-                rows.append([timestamp] + field_values + [tags_json])
+                # Fill in any missing tag columns with None
+                while len(tag_column_values) < len(self.tag_columns):
+                    tag_column_values.append(None)
+
+                # Build row data
+                row_data = [timestamp] + field_values + tag_column_values
+                
+                # Add tags JSON column only if not suppressed
+                if not self.suppress_tags_column:
+                    tags_json = json.dumps(remaining_tags) if remaining_tags else '{}'
+                    row_data.append(tags_json)
+                
+                rows.append(row_data)
 
             # Build insert query
             field_names = list(fields.keys())
-            columns = ['time'] + field_names + ['tags']
+            tag_column_names = [tag.replace('-', '_').replace(' ', '_') for tag in self.tag_columns]
+            columns = ['time'] + field_names + tag_column_names
+            
+            # Add tags column only if not suppressed
+            if not self.suppress_tags_column:
+                columns.append('tags')
+                
             placeholders = ', '.join(['%s'] * len(columns))
 
             insert_sql = f'''
@@ -585,6 +618,8 @@ def main():
     parser.add_argument('--measurements', nargs='*', help='Specific measurements to migrate (all if not specified)')
     parser.add_argument('--chunk-days', default=1, type=int, help='Number of days per time chunk (default: 1)')
     parser.add_argument('--state-file', default='migration_state.json', help='File to store migration progress (default: migration_state.json)')
+    parser.add_argument('--tag-columns', nargs='*', help='Tag keys to extract into separate database columns')
+    parser.add_argument('--suppress-tags-column', action='store_true', help='Suppress the general tags JSONB column (only keep explicitly requested tag columns)')
     parser.add_argument('--resume', action='store_true', help='Resume from previous migration state')
 
     args = parser.parse_args()
@@ -609,7 +644,9 @@ def main():
         influx_config,
         timescale_config,
         chunk_days=args.chunk_days,
-        state_file=args.state_file
+        state_file=args.state_file,
+        tag_columns=args.tag_columns,
+        suppress_tags_column=args.suppress_tags_column
     )
     migrator.migrate_bucket(args.influx_bucket, args.measurements)
 
