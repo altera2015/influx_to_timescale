@@ -331,7 +331,7 @@ class InfluxToTimescaleMigrator:
             return {}
 
     def migrate_measurement_chunk(self, bucket: str, measurement: str, start_time: datetime,
-                                 end_time: datetime, batch_size: int = 10000):
+                                 end_time: datetime, batch_size: int = 1000):
         """Migrate a time chunk of a measurement from InfluxDB to TimescaleDB"""
         try:
             chunk_key = f"{measurement}_{start_time.isoformat()}_{end_time.isoformat()}"
@@ -435,7 +435,7 @@ class InfluxToTimescaleMigrator:
             self.timescale_conn.rollback()
             raise
 
-    def migrate_measurement(self, bucket: str, measurement: str, batch_size: int = 10000):
+    def migrate_measurement(self, bucket: str, measurement: str, batch_size: int = 1000):
         """Migrate a single measurement from InfluxDB to TimescaleDB using time chunks"""
         try:
             self.logger.info(f"Starting migration of measurement: {measurement}")
